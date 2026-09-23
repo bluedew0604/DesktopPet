@@ -23,6 +23,10 @@ namespace DesktopPet
         [Header("캐릭터 그림 캔버스 전체가 화면에서 차지할 높이 (논리 px)")]
         public float characterHeight = 150f;
 
+        // 디버그용: true로 바꾸면 마우스 입력 처리 과정을 Player.log에 남긴다 (씬에 저장되지 않음)
+        [System.NonSerialized] public bool logInput = false;
+        private bool _lastHoverLogged, _lastThroughLogged = true;
+
         private const int MenuNormal = 1, MenuQuiet = 2, MenuHide = 3, MenuDiary = 4, MenuDiaryFolder = 5,
             MenuResetPos = 6, MenuIdleHint = 7, MenuReloadArt = 8, MenuQuit = 9;
 
@@ -98,6 +102,7 @@ namespace DesktopPet
             DateTime local = DateTime.Now;
 
             _win.Maintain(Time.unscaledDeltaTime);
+            if (_art.Loading) _art.ContinueLoading();
             UpdateLayout();
 
             if (_win.Active) HandleDesktopInput(now, local);
@@ -149,6 +154,7 @@ namespace DesktopPet
             HookEvent ev;
             while (WindowHooks.TryDequeue(out ev))
             {
+                if (logInput) Debug.Log("[입력] 창 메시지: " + ev + " 커서(창안)=" + client + " 판정=" + _view.HitTest(client, 12f));
                 switch (ev)
                 {
                     case HookEvent.MouseDown:
@@ -192,12 +198,21 @@ namespace DesktopPet
                         _dragging = true;
                         _brain.DragStart(now, local);
                         _ui.HideDiary();
+                        if (logInput) Debug.Log("[입력] 드래그 시작");
                     }
                     if (_dragging) _win.MoveTo(_pressWindowPos.x + dx, _pressWindowPos.y + dy);
                 }
             }
 
-            _win.SetClickThrough(_brain.Hidden || !(_hovering || _pressed));
+            bool through = _brain.Hidden || !(_hovering || _pressed);
+            _win.SetClickThrough(through);
+            if (logInput && (_hovering != _lastHoverLogged || through != _lastThroughLogged))
+            {
+                Debug.Log("[입력] hover=" + _hovering + " 클릭통과=" + through + " 커서(창안)=" + client + " inside=" + inside
+                    + " 화면=" + Screen.width + "x" + Screen.height + " 캐릭터머리=" + _view.HeadWorld());
+                _lastHoverLogged = _hovering;
+                _lastThroughLogged = through;
+            }
         }
 
         private void BeginPress(Vector2 pointer)
@@ -218,10 +233,12 @@ namespace DesktopPet
             {
                 _brain.DragEnd(now, local);
                 SavePosition();
+                if (logInput) Debug.Log("[입력] 드래그 끝");
             }
             else if (!cancelled)
             {
-                _brain.Click(now, local);
+                bool ok = _brain.Click(now, local);
+                if (logInput) Debug.Log("[입력] 클릭 → 반응=" + ok + " 현재행동=" + _brain.Current);
             }
             _pressed = false;
             _dragging = false;
@@ -458,6 +475,7 @@ namespace DesktopPet
                 _lastW = Screen.width;
                 _lastH = Screen.height;
                 _lastScale = scale;
+                Debug.Log("[DesktopPet] 화면 " + Screen.width + "x" + Screen.height + " 배율 " + scale);
                 _cam.orthographicSize = Screen.height * 0.5f;
                 _cam.transform.position = new Vector3(Screen.width * 0.5f, Screen.height * 0.5f, -10f);
                 _ui.SetScale(scale);

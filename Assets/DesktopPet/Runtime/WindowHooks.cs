@@ -65,7 +65,8 @@ namespace DesktopPet
         {
             lock (Events)
             {
-                if (Events.Count < 256) Events.Enqueue(e);
+                while (Events.Count >= 256) Events.Dequeue(); // 가득 차면 가장 오래된 것부터 버림
+                Events.Enqueue(e);
             }
         }
 

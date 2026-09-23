@@ -32,6 +32,25 @@ namespace DesktopPet
         private readonly Dictionary<Sprite, Rect> _opaque = new Dictionary<Sprite, Rect>();
         private readonly List<Texture2D> _owned = new List<Texture2D>();
         private readonly List<Sprite> _sprites = new List<Sprite>();
+        private readonly List<string> _pending = new List<string>();          // 아직 안 그린 임시 그림 동작
+        private readonly List<Sprite> _pendingFrames = new List<Sprite>();    // 지금 그리는 중인 동작의 프레임
+
+        /// <summary>임시 그림을 아직 그리는 중이면 true. 매 프레임 한 장씩 그린다(그동안 없는 동작은 기본 자세로 보임).</summary>
+        public bool Loading { get { return _pending.Count > 0; } }
+
+        public void ContinueLoading()
+        {
+            if (_pending.Count == 0) return;
+            string clip = _pending[0];
+            int n = PlaceholderArt.DefaultFrameCount(clip);
+            _pendingFrames.Add(MakeSprite(PlaceholderArt.Character(clip, _pendingFrames.Count), new Vector2(0.5f, 0f)));
+            if (_pendingFrames.Count >= n)
+            {
+                _clips[clip] = _pendingFrames.ToArray();
+                _pendingFrames.Clear();
+                _pending.RemoveAt(0);
+            }
+        }
 
         private static readonly Regex FramePattern = new Regex(@"^([a-z_]+?)_(\d+)$", RegexOptions.Compiled);
 
@@ -89,15 +108,17 @@ namespace DesktopPet
             // ---- 캐릭터 ----
             UsingPlaceholderCharacter = userFrames.Count == 0;
             var own = new Dictionary<string, Sprite[]>();
+            _pending.Clear();
             if (UsingPlaceholderCharacter)
             {
+                // 시작을 빠르게: 기본 자세만 지금 그리고, 나머지 동작은 ContinueLoading()에서 한 장씩 그린다.
+                int n = PlaceholderArt.DefaultFrameCount(ClipNames.Idle);
+                var idle = new Sprite[n];
+                for (int i = 0; i < n; i++) idle[i] = MakeSprite(PlaceholderArt.Character(ClipNames.Idle, i), new Vector2(0.5f, 0f));
+                own[ClipNames.Idle] = idle;
                 foreach (var clip in ClipNames.All)
-                {
-                    int n = PlaceholderArt.DefaultFrameCount(clip);
-                    var arr = new Sprite[n];
-                    for (int i = 0; i < n; i++) arr[i] = MakeSprite(PlaceholderArt.Character(clip, i), new Vector2(0.5f, 0f));
-                    own[clip] = arr;
-                }
+                    if (clip != ClipNames.Idle) _pending.Add(clip);
+                _pendingFrames.Clear();
                 report.AppendLine("캐릭터 그림이 없어 임시 그림 사용");
             }
             else
