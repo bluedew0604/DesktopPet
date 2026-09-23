@@ -43,7 +43,8 @@ namespace DesktopPet
 
         private bool _firstRun;
         private float _greetAt = -1f;
-        private bool _pressed, _dragging, _hovering, _menuPending;
+        private bool _pressed, _dragging, _hovering;
+        private int _menuSignature = -1;
         private Vector2Int _pressCursor, _pressWindowPos;
         private Vector2 _pressPointer, _editorOffset, _editorOffsetAtPress;
         private float _pressVisual, _lastButtonSeenDown;
@@ -85,7 +86,8 @@ namespace DesktopPet
             if (_win.Active)
             {
                 if (!WindowHooks.Install(_win.Hwnd)) Debug.LogWarning("[DesktopPet] 창 메시지 연결 실패 — 클릭 반응이 느릴 수 있음");
-                _tray.Add(_win.Hwnd, WriteTrayIcon(), "DesktopPet");
+                UpdateTrayMenuItems();
+                _tray.Start(WriteTrayIcon(), "DesktopPet");
             }
             else if (!Application.isEditor)
             {
@@ -131,10 +133,11 @@ namespace DesktopPet
                 _save.SaveSettings(_settings);
             }
 
-            if (_menuPending)
+            if (_win.Active)
             {
-                _menuPending = false;
-                ShowTrayMenu();
+                UpdateTrayMenuItems();
+                int cmd;
+                while (_tray.TryDequeueCommand(out cmd)) ExecuteMenuCommand(cmd);
             }
 
             ApplyFrameRate(frame);
@@ -166,17 +169,13 @@ namespace DesktopPet
                     case HookEvent.CaptureLost:
                         EndPress(now, local, true);
                         break;
-                    case HookEvent.TrayLeftClick:
-                        if (_brain.Hidden) SetHidden(false, now, local);
-                        else ToggleDiary();
-                        break;
-                    case HookEvent.TrayRightClick:
-                        _menuPending = true;
-                        break;
-                    case HookEvent.TaskbarRestarted:
-                        _tray.Readd();
-                        break;
                 }
+            }
+
+            while (_tray.TryConsumeLeftClick())
+            {
+                if (_brain.Hidden) SetHidden(false, now, local);
+                else ToggleDiary();
             }
 
             if (_pressed)
@@ -292,10 +291,13 @@ namespace DesktopPet
         // 트레이 메뉴 / 모드
         // =================================================================
 
-        private void ShowTrayMenu()
+        /// <summary>메뉴 체크 표시가 바뀔 때만 메뉴 항목을 다시 만들어 창 스레드에 넘긴다.</summary>
+        private void UpdateTrayMenuItems()
         {
-            if (!_win.Active) return;
-            var items = new List<TrayIcon.MenuItem>
+            int sig = (_brain.Quiet ? 1 : 0) | (_brain.Hidden ? 2 : 0) | (_brain.IdleHintEnabled ? 4 : 0);
+            if (sig == _menuSignature) return;
+            _menuSignature = sig;
+            var items = new[]
             {
                 new TrayIcon.MenuItem { Id = MenuNormal, Text = "보통 모드", Checked = !_brain.Quiet },
                 new TrayIcon.MenuItem { Id = MenuQuiet, Text = "조용히 모드", Checked = _brain.Quiet },
@@ -310,10 +312,14 @@ namespace DesktopPet
                 new TrayIcon.MenuItem { Id = 0 },
                 new TrayIcon.MenuItem { Id = MenuQuit, Text = "종료" },
             };
+            _tray.SetMenu(items);
+        }
 
-            int cmd = _tray.ShowMenu(items);
+        private void ExecuteMenuCommand(int cmd)
+        {
             double now = _clock.Now();
             DateTime local = DateTime.Now;
+            Debug.Log("[DesktopPet] 트레이 메뉴 선택: " + cmd);
             switch (cmd)
             {
                 case MenuNormal: SetQuiet(false, now, local); break;
@@ -514,7 +520,7 @@ namespace DesktopPet
                 if (_brain != null) _save.SaveDiary(_brain.Diary);
             }
             catch (Exception ex) { Debug.LogWarning("[DesktopPet] 종료 저장 실패: " + ex.Message); }
-            if (_tray != null) _tray.Remove();
+            if (_tray != null) _tray.Stop();
             WindowHooks.Uninstall();
             if (_art != null) _art.Unload();
         }

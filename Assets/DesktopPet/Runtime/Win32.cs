@@ -44,6 +44,35 @@ namespace DesktopPet
             public IntPtr hBalloonIcon;
         }
 
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct WNDCLASSEX
+        {
+            public uint cbSize;
+            public uint style;
+            public IntPtr lpfnWndProc;
+            public int cbClsExtra;
+            public int cbWndExtra;
+            public IntPtr hInstance;
+            public IntPtr hIcon;
+            public IntPtr hCursor;
+            public IntPtr hbrBackground;
+            public string lpszMenuName;
+            public string lpszClassName;
+            public IntPtr hIconSm;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSG
+        {
+            public IntPtr hwnd;
+            public uint message;
+            public IntPtr wParam;
+            public IntPtr lParam;
+            public uint time;
+            public POINT pt;
+            public uint lPrivate;
+        }
+
         public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
         public delegate IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
@@ -72,6 +101,8 @@ namespace DesktopPet
         public const int VK_LBUTTON = 0x01;
 
         public const uint WM_NULL = 0x0000;
+        public const uint WM_DESTROY = 0x0002;
+        public const uint WM_CLOSE = 0x0010;
         public const uint WM_MOUSEACTIVATE = 0x0021;
         public const uint WM_LBUTTONDOWN = 0x0201;
         public const uint WM_LBUTTONUP = 0x0202;
@@ -133,13 +164,29 @@ namespace DesktopPet
         [DllImport("user32.dll")] public static extern IntPtr SetCapture(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool ReleaseCapture();
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-        [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
-        [DllImport("user32.dll")] public static extern IntPtr CallWindowProc(IntPtr prev, IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+        [DllImport("user32.dll", EntryPoint = "PostMessageW")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+        [DllImport("user32.dll", EntryPoint = "CallWindowProcW")] public static extern IntPtr CallWindowProc(IntPtr prev, IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern uint RegisterWindowMessage(string name);
 
         [DllImport("user32.dll")] public static extern IntPtr CreatePopupMenu();
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool AppendMenu(IntPtr menu, uint flags, UIntPtr id, string text);
-        [DllImport("user32.dll")] public static extern int TrackPopupMenuEx(IntPtr menu, uint flags, int x, int y, IntPtr hWnd, IntPtr tpm);
+        [DllImport("user32.dll", SetLastError = true)] public static extern int TrackPopupMenuEx(IntPtr menu, uint flags, int x, int y, IntPtr hWnd, IntPtr tpm);
+
+        // 트레이 전용 숨은 창
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "RegisterClassExW")]
+        public static extern ushort RegisterClassEx(ref WNDCLASSEX wc);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "UnregisterClassW")]
+        public static extern bool UnregisterClass(string className, IntPtr hInstance);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateWindowExW")]
+        public static extern IntPtr CreateWindowEx(uint exStyle, string className, string windowName, uint style,
+            int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr hInstance, IntPtr param);
+        [DllImport("user32.dll")] public static extern bool DestroyWindow(IntPtr hWnd);
+        [DllImport("user32.dll", EntryPoint = "DefWindowProcW")] public static extern IntPtr DefWindowProc(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
+        [DllImport("user32.dll", EntryPoint = "GetMessageW")] public static extern int GetMessage(out MSG msg, IntPtr hWnd, uint min, uint max);
+        [DllImport("user32.dll")] public static extern bool TranslateMessage(ref MSG msg);
+        [DllImport("user32.dll", EntryPoint = "DispatchMessageW")] public static extern IntPtr DispatchMessage(ref MSG msg);
+        [DllImport("user32.dll")] public static extern void PostQuitMessage(int code);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetModuleHandleW")] public static extern IntPtr GetModuleHandle(string name);
         [DllImport("user32.dll")] public static extern bool DestroyMenu(IntPtr menu);
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr LoadImage(IntPtr hInst, string name, uint type, int cx, int cy, uint load);

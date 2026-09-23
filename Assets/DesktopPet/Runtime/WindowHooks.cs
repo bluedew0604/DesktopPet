@@ -2,24 +2,23 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 using UnityEngine;
 
 namespace DesktopPet
 {
-    public enum HookEvent { MouseDown, MouseUp, CaptureLost, TrayLeftClick, TrayRightClick, TaskbarRestarted }
+    public enum HookEvent { MouseDown, MouseUp, CaptureLost }
 
     /// <summary>
     /// Unity 창의 메시지를 가로채서 (1) 마우스 누름/뗌을 하나도 빠짐없이 기록하고,
-    /// (2) 클릭해도 창이 활성화되지 않게 하고(포커스 안 뺏기), (3) 트레이 아이콘 클릭을 받는다.
+    /// (2) 클릭해도 창이 활성화되지 않게 한다(포커스 안 뺏기).
     /// 프레임마다 마우스 상태를 훑는 방식은 아주 짧은 클릭을 놓칠 수 있어서 메시지로 받는다.
+    /// (Unity 윈도우 플레이어는 창 메시지를 게임 메인 스레드와 다른 스레드에서 처리하므로 큐는 잠금으로 보호)
     /// </summary>
     public static class WindowHooks
     {
-        public const uint TrayCallbackMessage = Win32.WM_APP + 1;
-
         private static IntPtr _hwnd;
         private static IntPtr _oldProc;
-        private static uint _taskbarCreated;
         private static bool _capturing;
         private static readonly Win32.WndProc Proc = HookProc;
         private static readonly Queue<HookEvent> Events = new Queue<HookEvent>();
@@ -30,7 +29,6 @@ namespace DesktopPet
         {
             if (Installed || hwnd == IntPtr.Zero) return Installed;
             _hwnd = hwnd;
-            _taskbarCreated = Win32.RegisterWindowMessage("TaskbarCreated");
             IntPtr fn = Marshal.GetFunctionPointerForDelegate(Proc);
             _oldProc = Win32.SetWindowLongPtr(hwnd, Win32.GWLP_WNDPROC, fn);
             return _oldProc != IntPtr.Zero;
@@ -39,7 +37,7 @@ namespace DesktopPet
         public static void Uninstall()
         {
             if (!Installed) return;
-            if (_capturing) { _capturing = false; Win32.ReleaseCapture(); }
+            _capturing = false;
             Win32.SetWindowLongPtr(_hwnd, Win32.GWLP_WNDPROC, _oldProc);
             _oldProc = IntPtr.Zero;
         }
@@ -54,11 +52,12 @@ namespace DesktopPet
             return false;
         }
 
+        /// <summary>
+        /// 게임 쪽에서 누름 상태를 끝냈을 때 호출. 마우스 캡처는 창 스레드 소유라 여기서 풀 수 없고,
+        /// 버튼을 떼는 순간 창 스레드(HookProc)에서 자동으로 풀린다.
+        /// </summary>
         public static void EndCapture()
         {
-            if (!_capturing) return;
-            _capturing = false;
-            Win32.ReleaseCapture();
         }
 
         private static void Push(HookEvent e)
@@ -93,17 +92,6 @@ namespace DesktopPet
                 {
                     if (_capturing) { _capturing = false; Push(HookEvent.CaptureLost); }
                 }
-                else if (msg == TrayCallbackMessage)
-                {
-                    uint mouseMsg = unchecked((uint)(lParam.ToInt64() & 0xFFFF));
-                    if (mouseMsg == Win32.WM_LBUTTONUP) Push(HookEvent.TrayLeftClick);
-                    else if (mouseMsg == Win32.WM_RBUTTONUP || mouseMsg == Win32.WM_CONTEXTMENU) Push(HookEvent.TrayRightClick);
-                    return IntPtr.Zero;
-                }
-                else if (_taskbarCreated != 0 && msg == _taskbarCreated)
-                {
-                    Push(HookEvent.TaskbarRestarted);
-                }
             }
             catch (Exception)
             {
@@ -113,7 +101,12 @@ namespace DesktopPet
         }
     }
 
-    /// <summary>작업표시줄 알림 영역(트레이) 아이콘 + 오른쪽 클릭 메뉴.</summary>
+    /// <summary>
+    /// 작업표시줄 알림 영역(트레이) 아이콘 + 오른쪽 클릭 메뉴.
+    /// Unity 창과 완전히 분리된 "숨은 전용 창"을 전용 스레드에서 만들고 그 스레드에서 메시지를 돌린다.
+    /// (일반 윈도우 트레이 프로그램과 같은 방식 — Unity 창의 스레드/스타일 영향을 받지 않음)
+    /// 게임 쪽(메인 스레드)과는 잠금으로 보호된 큐로만 주고받는다.
+    /// </summary>
     public sealed class TrayIcon
     {
         public struct MenuItem
@@ -124,60 +117,189 @@ namespace DesktopPet
             public bool Disabled;
         }
 
+        private const uint CallbackMessage = Win32.WM_APP + 1;
+        private const uint ReplaceIconMessage = Win32.WM_APP + 2;
+        private const string ClassName = "DesktopPetTrayWindow";
+
+        private static TrayIcon _instance; // 창 프로시저(정적)에서 찾기 위함
+        private static readonly Win32.WndProc Proc = TrayProc;
+
+        private readonly object _lock = new object();
+        private readonly Queue<int> _commands = new Queue<int>();
+        private int _leftClicks;
+        private MenuItem[] _menu;
+        private string _icoPath, _pendingIcoPath, _tip;
+
+        private Thread _thread;
         private IntPtr _hwnd;
         private IntPtr _icon;
         private bool _ownsIcon;
         private bool _added;
-        private string _tip;
+        private uint _taskbarCreated;
+        private volatile bool _started;
 
-        public bool Added { get { return _added; } }
+        public bool Running { get { return _started; } }
 
-        public bool Add(IntPtr hwnd, string icoPath, string tip)
+        // ---------------- 게임(메인) 스레드에서 호출 ----------------
+
+        public void Start(string icoPath, string tip)
         {
-            _hwnd = hwnd;
+            if (_thread != null) return;
+            _instance = this;
+            _icoPath = icoPath;
             _tip = tip;
-            LoadIconFile(icoPath);
-            var data = MakeData(Win32.NIF_MESSAGE | Win32.NIF_ICON | Win32.NIF_TIP);
-            _added = Win32.Shell_NotifyIcon(Win32.NIM_ADD, ref data);
-            return _added;
+            _thread = new Thread(ThreadMain) { IsBackground = true, Name = "DesktopPet Tray" };
+            _thread.Start();
         }
 
-        /// <summary>탐색기가 재시작되면 아이콘이 사라지므로 다시 등록.</summary>
-        public void Readd()
+        public void SetMenu(MenuItem[] items)
         {
-            if (_hwnd == IntPtr.Zero) return;
-            var data = MakeData(Win32.NIF_MESSAGE | Win32.NIF_ICON | Win32.NIF_TIP);
-            _added = Win32.Shell_NotifyIcon(Win32.NIM_ADD, ref data);
+            lock (_lock) _menu = items;
+        }
+
+        public bool TryDequeueCommand(out int id)
+        {
+            lock (_lock)
+            {
+                if (_commands.Count > 0) { id = _commands.Dequeue(); return true; }
+            }
+            id = 0;
+            return false;
+        }
+
+        public bool TryConsumeLeftClick()
+        {
+            lock (_lock)
+            {
+                if (_leftClicks > 0) { _leftClicks--; return true; }
+            }
+            return false;
         }
 
         public void ReplaceIcon(string icoPath)
         {
-            if (!_added) return;
-            IntPtr old = _icon;
-            bool ownedOld = _ownsIcon;
-            LoadIconFile(icoPath);
-            var data = MakeData(Win32.NIF_ICON);
-            Win32.Shell_NotifyIcon(Win32.NIM_MODIFY, ref data);
-            if (ownedOld && old != IntPtr.Zero && old != _icon) Win32.DestroyIcon(old);
+            lock (_lock) _pendingIcoPath = icoPath;
+            if (_hwnd != IntPtr.Zero) Win32.PostMessage(_hwnd, ReplaceIconMessage, IntPtr.Zero, IntPtr.Zero);
         }
 
-        public void Remove()
+        public void Stop()
         {
-            if (_added)
+            if (_thread == null) return;
+            if (_hwnd != IntPtr.Zero) Win32.PostMessage(_hwnd, Win32.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            _thread.Join(1500);
+            _thread = null;
+        }
+
+        // ---------------- 트레이 전용 스레드 ----------------
+
+        private void ThreadMain()
+        {
+            try
             {
-                var data = MakeData(0);
-                Win32.Shell_NotifyIcon(Win32.NIM_DELETE, ref data);
-                _added = false;
+                IntPtr hInst = Win32.GetModuleHandle(null);
+                var wc = new Win32.WNDCLASSEX
+                {
+                    cbSize = (uint)Marshal.SizeOf(typeof(Win32.WNDCLASSEX)),
+                    lpfnWndProc = Marshal.GetFunctionPointerForDelegate(Proc),
+                    hInstance = hInst,
+                    lpszClassName = ClassName
+                };
+                ushort atom = Win32.RegisterClassEx(ref wc);
+                if (atom == 0) Debug.LogWarning("[DesktopPet] 트레이 창 클래스 등록 실패 오류=" + Marshal.GetLastWin32Error());
+
+                _hwnd = Win32.CreateWindowEx(0, ClassName, "DesktopPet Tray", Win32.WS_POPUP, 0, 0, 0, 0,
+                    IntPtr.Zero, IntPtr.Zero, hInst, IntPtr.Zero);
+                if (_hwnd == IntPtr.Zero)
+                {
+                    Debug.LogWarning("[DesktopPet] 트레이 창 만들기 실패 오류=" + Marshal.GetLastWin32Error());
+                    return;
+                }
+
+                _taskbarCreated = Win32.RegisterWindowMessage("TaskbarCreated");
+                LoadIconFile(_icoPath);
+                AddIcon();
+                _started = true;
+                Debug.Log("[DesktopPet] 트레이 준비됨 (아이콘 등록=" + _added + ")");
+
+                Win32.MSG msg;
+                while (Win32.GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
+                {
+                    Win32.TranslateMessage(ref msg);
+                    Win32.DispatchMessage(ref msg);
+                }
             }
-            if (_ownsIcon && _icon != IntPtr.Zero) Win32.DestroyIcon(_icon);
-            _icon = IntPtr.Zero;
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[DesktopPet] 트레이 스레드 오류: " + ex);
+            }
+            finally
+            {
+                RemoveIcon();
+                if (_hwnd != IntPtr.Zero) { Win32.DestroyWindow(_hwnd); _hwnd = IntPtr.Zero; }
+                Win32.UnregisterClass(ClassName, Win32.GetModuleHandle(null));
+                _started = false;
+            }
         }
 
-        /// <summary>커서 위치에 메뉴를 띄우고 고른 항목 Id를 돌려준다(취소하면 0). 메뉴가 떠 있는 동안은 멈춘다.</summary>
-        public int ShowMenu(IList<MenuItem> items)
+        [AOT.MonoPInvokeCallback(typeof(Win32.WndProc))]
+        private static IntPtr TrayProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
         {
+            var self = _instance;
+            try
+            {
+                if (self != null)
+                {
+                    if (msg == CallbackMessage)
+                    {
+                        uint mouseMsg = unchecked((uint)(lParam.ToInt64() & 0xFFFF));
+                        if (mouseMsg != 0x0200) // 마우스 이동(0x200)은 너무 많아서 기록 안 함
+                            Debug.Log("[DesktopPet] 트레이 신호 0x" + mouseMsg.ToString("X"));
+                        // 왼쪽·오른쪽 클릭 모두 메뉴를 띄운다 (일기는 메뉴의 '오늘 일기 보기')
+                        if (mouseMsg == Win32.WM_LBUTTONUP || mouseMsg == Win32.WM_RBUTTONUP || mouseMsg == Win32.WM_CONTEXTMENU)
+                            self.ShowMenu(hWnd);
+                        return IntPtr.Zero;
+                    }
+                    if (msg == ReplaceIconMessage)
+                    {
+                        string path;
+                        lock (self._lock) { path = self._pendingIcoPath; self._pendingIcoPath = null; }
+                        if (path != null) self.SwapIcon(path);
+                        return IntPtr.Zero;
+                    }
+                    if (self._taskbarCreated != 0 && msg == self._taskbarCreated)
+                    {
+                        self._added = false;
+                        self.AddIcon(); // 탐색기가 재시작되면 아이콘이 사라지므로 다시 등록
+                        return IntPtr.Zero;
+                    }
+                }
+                if (msg == Win32.WM_CLOSE)
+                {
+                    Win32.DestroyWindow(hWnd);
+                    return IntPtr.Zero;
+                }
+                if (msg == Win32.WM_DESTROY)
+                {
+                    if (self != null) self.RemoveIcon();
+                    Win32.PostQuitMessage(0);
+                    return IntPtr.Zero;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[DesktopPet] 트레이 메시지 처리 오류: " + ex.Message);
+            }
+            return Win32.DefWindowProc(hWnd, msg, wParam, lParam);
+        }
+
+        private void ShowMenu(IntPtr hWnd)
+        {
+            MenuItem[] items;
+            lock (_lock) items = _menu;
+            if (items == null) return;
+
             IntPtr menu = Win32.CreatePopupMenu();
-            if (menu == IntPtr.Zero) return 0;
+            if (menu == IntPtr.Zero) return;
             try
             {
                 foreach (var it in items)
@@ -190,15 +312,54 @@ namespace DesktopPet
                 }
                 Win32.POINT p;
                 Win32.GetCursorPos(out p);
-                Win32.SetForegroundWindow(_hwnd); // 이게 없으면 메뉴 밖을 눌러도 메뉴가 안 닫힌다
-                int cmd = Win32.TrackPopupMenuEx(menu, Win32.TPM_RIGHTBUTTON | Win32.TPM_RETURNCMD | Win32.TPM_NONOTIFY | Win32.TPM_BOTTOMALIGN, p.X, p.Y, _hwnd, IntPtr.Zero);
-                Win32.PostMessage(_hwnd, Win32.WM_NULL, IntPtr.Zero, IntPtr.Zero);
-                return cmd;
+                bool fg = Win32.SetForegroundWindow(hWnd); // 이게 없으면 메뉴 밖을 눌러도 메뉴가 안 닫힌다
+                Debug.Log("[DesktopPet] 트레이 메뉴 띄움 (전면=" + fg + ", 위치=" + p.X + "," + p.Y + ")");
+                int cmd = Win32.TrackPopupMenuEx(menu, Win32.TPM_RIGHTBUTTON | Win32.TPM_RETURNCMD | Win32.TPM_NONOTIFY | Win32.TPM_BOTTOMALIGN, p.X, p.Y, hWnd, IntPtr.Zero);
+                int err = cmd == 0 ? Marshal.GetLastWin32Error() : 0;
+                Win32.PostMessage(hWnd, Win32.WM_NULL, IntPtr.Zero, IntPtr.Zero);
+                Debug.Log("[DesktopPet] 트레이 메뉴 결과=" + cmd + (err != 0 ? " 오류=" + err : ""));
+                if (cmd != 0)
+                {
+                    lock (_lock)
+                    {
+                        while (_commands.Count >= 32) _commands.Dequeue();
+                        _commands.Enqueue(cmd);
+                    }
+                }
             }
             finally
             {
                 Win32.DestroyMenu(menu);
             }
+        }
+
+        private void AddIcon()
+        {
+            var data = MakeData(Win32.NIF_MESSAGE | Win32.NIF_ICON | Win32.NIF_TIP);
+            _added = Win32.Shell_NotifyIcon(Win32.NIM_ADD, ref data);
+        }
+
+        private void RemoveIcon()
+        {
+            if (_added)
+            {
+                var data = MakeData(0);
+                Win32.Shell_NotifyIcon(Win32.NIM_DELETE, ref data);
+                _added = false;
+            }
+            if (_ownsIcon && _icon != IntPtr.Zero) Win32.DestroyIcon(_icon);
+            _icon = IntPtr.Zero;
+            _ownsIcon = false;
+        }
+
+        private void SwapIcon(string icoPath)
+        {
+            IntPtr old = _icon;
+            bool ownedOld = _ownsIcon;
+            LoadIconFile(icoPath);
+            var data = MakeData(Win32.NIF_ICON);
+            Win32.Shell_NotifyIcon(Win32.NIM_MODIFY, ref data);
+            if (ownedOld && old != IntPtr.Zero && old != _icon) Win32.DestroyIcon(old);
         }
 
         private void LoadIconFile(string icoPath)
@@ -222,7 +383,7 @@ namespace DesktopPet
                 hWnd = _hwnd,
                 uID = 1,
                 uFlags = flags,
-                uCallbackMessage = WindowHooks.TrayCallbackMessage,
+                uCallbackMessage = CallbackMessage,
                 hIcon = _icon,
                 szTip = _tip ?? "",
                 szInfo = "",
