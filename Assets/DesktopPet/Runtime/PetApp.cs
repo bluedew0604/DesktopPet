@@ -88,6 +88,7 @@ namespace DesktopPet
                 if (!WindowHooks.Install(_win.Hwnd)) Debug.LogWarning("[DesktopPet] 창 메시지 연결 실패 — 클릭 반응이 느릴 수 있음");
                 UpdateTrayMenuItems();
                 _tray.Start(WriteTrayIcon(), "DesktopPet");
+                WindowHooks.MenuTray = _tray; // 캐릭터 우클릭 → 같은 메뉴
             }
             else if (!Application.isEditor)
             {
@@ -319,7 +320,6 @@ namespace DesktopPet
         {
             double now = _clock.Now();
             DateTime local = DateTime.Now;
-            Debug.Log("[DesktopPet] 트레이 메뉴 선택: " + cmd);
             switch (cmd)
             {
                 case MenuNormal: SetQuiet(false, now, local); break;
@@ -520,6 +520,7 @@ namespace DesktopPet
                 if (_brain != null) _save.SaveDiary(_brain.Diary);
             }
             catch (Exception ex) { Debug.LogWarning("[DesktopPet] 종료 저장 실패: " + ex.Message); }
+            WindowHooks.MenuTray = null;
             if (_tray != null) _tray.Stop();
             WindowHooks.Uninstall();
             if (_art != null) _art.Unload();

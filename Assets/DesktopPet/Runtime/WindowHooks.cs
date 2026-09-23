@@ -25,6 +25,9 @@ namespace DesktopPet
 
         public static bool Installed { get { return _oldProc != IntPtr.Zero; } }
 
+        /// <summary>캐릭터를 오른쪽 클릭하면 이 트레이의 메뉴를 띄운다(메뉴는 트레이 전용 스레드에서 뜸).</summary>
+        public static TrayIcon MenuTray;
+
         public static bool Install(IntPtr hwnd)
         {
             if (Installed || hwnd == IntPtr.Zero) return Installed;
@@ -92,6 +95,12 @@ namespace DesktopPet
                 {
                     if (_capturing) { _capturing = false; Push(HookEvent.CaptureLost); }
                 }
+                else if (msg == Win32.WM_RBUTTONUP)
+                {
+                    // 창은 커서가 캐릭터 위에 있을 때만 클릭을 받으므로, 여기 오면 캐릭터를 우클릭한 것
+                    var tray = MenuTray;
+                    if (tray != null) { tray.ShowMenuAtCursor(); return IntPtr.Zero; }
+                }
             }
             catch (Exception)
             {
@@ -119,6 +128,7 @@ namespace DesktopPet
 
         private const uint CallbackMessage = Win32.WM_APP + 1;
         private const uint ReplaceIconMessage = Win32.WM_APP + 2;
+        private const uint ShowMenuMessage = Win32.WM_APP + 3;
         private const string ClassName = "DesktopPetTrayWindow";
 
         private static TrayIcon _instance; // 창 프로시저(정적)에서 찾기 위함
@@ -174,6 +184,12 @@ namespace DesktopPet
                 if (_leftClicks > 0) { _leftClicks--; return true; }
             }
             return false;
+        }
+
+        /// <summary>다른 스레드에서 호출 가능: 트레이 스레드에게 커서 위치에 메뉴를 띄우라고 요청.</summary>
+        public void ShowMenuAtCursor()
+        {
+            if (_hwnd != IntPtr.Zero) Win32.PostMessage(_hwnd, ShowMenuMessage, IntPtr.Zero, IntPtr.Zero);
         }
 
         public void ReplaceIcon(string icoPath)
@@ -252,11 +268,14 @@ namespace DesktopPet
                     if (msg == CallbackMessage)
                     {
                         uint mouseMsg = unchecked((uint)(lParam.ToInt64() & 0xFFFF));
-                        if (mouseMsg != 0x0200) // 마우스 이동(0x200)은 너무 많아서 기록 안 함
-                            Debug.Log("[DesktopPet] 트레이 신호 0x" + mouseMsg.ToString("X"));
                         // 왼쪽·오른쪽 클릭 모두 메뉴를 띄운다 (일기는 메뉴의 '오늘 일기 보기')
                         if (mouseMsg == Win32.WM_LBUTTONUP || mouseMsg == Win32.WM_RBUTTONUP || mouseMsg == Win32.WM_CONTEXTMENU)
                             self.ShowMenu(hWnd);
+                        return IntPtr.Zero;
+                    }
+                    if (msg == ShowMenuMessage)
+                    {
+                        self.ShowMenu(hWnd);
                         return IntPtr.Zero;
                     }
                     if (msg == ReplaceIconMessage)
@@ -313,11 +332,11 @@ namespace DesktopPet
                 Win32.POINT p;
                 Win32.GetCursorPos(out p);
                 bool fg = Win32.SetForegroundWindow(hWnd); // 이게 없으면 메뉴 밖을 눌러도 메뉴가 안 닫힌다
-                Debug.Log("[DesktopPet] 트레이 메뉴 띄움 (전면=" + fg + ", 위치=" + p.X + "," + p.Y + ")");
+                if (!fg) Debug.LogWarning("[DesktopPet] 메뉴 전면 전환 실패 — 메뉴 밖 클릭 시 안 닫힐 수 있음");
                 int cmd = Win32.TrackPopupMenuEx(menu, Win32.TPM_RIGHTBUTTON | Win32.TPM_RETURNCMD | Win32.TPM_NONOTIFY | Win32.TPM_BOTTOMALIGN, p.X, p.Y, hWnd, IntPtr.Zero);
                 int err = cmd == 0 ? Marshal.GetLastWin32Error() : 0;
                 Win32.PostMessage(hWnd, Win32.WM_NULL, IntPtr.Zero, IntPtr.Zero);
-                Debug.Log("[DesktopPet] 트레이 메뉴 결과=" + cmd + (err != 0 ? " 오류=" + err : ""));
+                if (err != 0) Debug.LogWarning("[DesktopPet] 메뉴 표시 오류=" + err);
                 if (cmd != 0)
                 {
                     lock (_lock)
